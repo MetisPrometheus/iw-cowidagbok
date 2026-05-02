@@ -4,6 +4,9 @@ from __future__ import annotations
 import hmac
 import html
 import re
+import tempfile
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import pandas as pd
@@ -176,6 +179,70 @@ def _clean_sheet(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
     df["Ark"] = sheet_name
     df["År"] = _extract_year(sheet_name)
     return df.reset_index(drop=True)
+
+
+@st.cache_data(show_spinner="Henter dagbok fra privat repo…", ttl=600)
+def _download_xlsx(repo: str, ref: str, path: str, token: str) -> str:
+    """Download the xlsx via GitHub Contents API and return a local path.
+
+    Cached for 10 minutes so reruns don't repeatedly hit GitHub.
+    """
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    if ref:
+        url += f"?ref={ref}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github.raw",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "cowidagbok-streamlit",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = resp.read()
+    except urllib.error.HTTPError as e:
+        st.error(
+            f"Klarte ikke hente `{path}` fra `{repo}` (HTTP {e.code}). "
+            "Sjekk `data_repo`, `data_path`, `data_ref` og `github_token` i secrets."
+        )
+        st.stop()
+    except urllib.error.URLError as e:
+        st.error(f"Nettverksfeil mot GitHub: {e.reason}")
+        st.stop()
+
+    tmp_dir = Path(tempfile.gettempdir()) / "cowidagbok"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    out = tmp_dir / Path(path).name
+    out.write_bytes(data)
+    return str(out)
+
+
+def _resolve_xlsx_path() -> tuple[str, float]:
+    """Return (path, cache_signature) for the diary spreadsheet.
+
+    Uses a local file next to app.py when present (dev mode); otherwise
+    fetches from a private GitHub repo configured in `st.secrets`.
+    The signature is used to invalidate `load_data`'s cache.
+    """
+    local = Path(__file__).parent / XLSX_NAME
+    if local.exists():
+        return str(local), local.stat().st_mtime
+
+    repo = st.secrets.get("data_repo")
+    token = st.secrets.get("github_token")
+    if not (repo and token):
+        st.error(
+            f"Fant ikke `{XLSX_NAME}` lokalt, og `data_repo` / `github_token` "
+            "er ikke satt i secrets."
+        )
+        st.stop()
+    path = st.secrets.get("data_path", XLSX_NAME)
+    ref = st.secrets.get("data_ref", "main")
+    downloaded = _download_xlsx(repo, ref, path, token)
+    # Signature ties cache to (repo, ref, path) so a secrets change reloads.
+    return downloaded, hash((repo, ref, path))
 
 
 @st.cache_data(show_spinner="Laster dagbok…")
@@ -466,13 +533,8 @@ def main():
     if not _check_password():
         return
 
-    xlsx_path = Path(__file__).parent / XLSX_NAME
-    if not xlsx_path.exists():
-        st.error(f"Fant ikke `{XLSX_NAME}` ved siden av appen. Last opp filen til "
-                 "repoet og deploy på nytt.")
-        st.stop()
-
-    master, per_sheet = load_data(str(xlsx_path), xlsx_path.stat().st_mtime)
+    xlsx_path, signature = _resolve_xlsx_path()
+    master, per_sheet = load_data(xlsx_path, signature)
 
     with st.sidebar:
         st.markdown(f"### 📓 {APP_TITLE}")

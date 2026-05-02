@@ -9,3 +9,6 @@ venv/
 .idea/
 .vscode/
 .claude/
+
+# Diary data lives in a separate private repo; never commit it here.
+Dagbok_*.xlsx
