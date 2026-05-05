@@ -301,7 +301,10 @@ def _highlight_fuzzy_span(text: str, query: str) -> str:
     )
 
 
-def filter_search(df: pd.DataFrame, query: str, mode: str, fuzzy_threshold: int) -> pd.DataFrame:
+FUZZY_THRESHOLD = 75
+
+
+def filter_search(df: pd.DataFrame, query: str, fuzzy: bool) -> pd.DataFrame:
     if not query.strip():
         return df
     text = df["Dagbok"].fillna("").astype(str)
@@ -309,16 +312,11 @@ def filter_search(df: pd.DataFrame, query: str, mode: str, fuzzy_threshold: int)
     haystack = (text + " ⏐ " + oppdrag).str.lower()
     q = query.strip().lower()
 
-    if mode == "Inneholder":
-        mask = haystack.str.contains(re.escape(q), regex=True, na=False)
-    elif mode == "Alle ord":
-        tokens = [t for t in q.split() if t]
-        mask = pd.Series(True, index=df.index)
-        for t in tokens:
-            mask &= haystack.str.contains(re.escape(t), regex=True, na=False)
-    else:  # Fuzzy
+    if fuzzy:
         scores = haystack.map(lambda h: fuzz.partial_ratio(q, h) if h else 0)
-        mask = scores >= fuzzy_threshold
+        mask = scores >= FUZZY_THRESHOLD
+    else:
+        mask = haystack.str.contains(re.escape(q), regex=True, na=False)
 
     return df[mask].copy()
 
@@ -357,50 +355,30 @@ def render_search_tab(master: pd.DataFrame, n_entries: int, n_sheets: int):
     else:
         yr_from, yr_to = None, None
 
-    col_q, col_mode, col_thr = st.columns([5, 2, 2])
-    with col_q:
-        query = st.text_input(
-            "Søk", placeholder="Søk etter ord, prosjektnummer, navn …",
-            label_visibility="collapsed",
-        )
-    with col_mode:
-        mode = st.selectbox("Modus", ["Inneholder", "Alle ord", "Fuzzy"],
-                            label_visibility="collapsed")
-    with col_thr:
-        threshold = st.slider("Likhet", 50, 100, 75, disabled=(mode != "Fuzzy"),
-                              label_visibility="collapsed")
+    query = st.text_input(
+        "Søk", placeholder="Søk etter ord, prosjektnummer, navn …",
+        label_visibility="collapsed",
+    )
+    fuzzy = st.toggle("Fuzzy søk", value=False,
+                      help="Tolererer skrivefeil og delvise treff.")
 
     df = master.copy()
     if yr_from is not None and yr_to is not None:
         år_int = pd.to_numeric(df["År"], errors="coerce")
         df = df[år_int.between(yr_from, yr_to)]
 
-    df = filter_search(df, query, mode, threshold)
+    df = filter_search(df, query, fuzzy)
 
-    # Result header
-    left, right = st.columns([3, 1])
-    with left:
-        st.caption(f"**{len(df):,}** treff".replace(",", " "))
-    with right:
-        if not df.empty:
-            csv = df.to_csv(index=False).encode("utf-8")
-            st.download_button("⬇ Last ned CSV", csv,
-                               file_name="dagbok_treff.csv", mime="text/csv",
-                               use_container_width=True)
+    st.caption(f"**{len(df):,}** treff".replace(",", " "))
 
     if df.empty:
-        st.info("Ingen treff. Prøv et kortere søk eller bytt til *Fuzzy*-modus.")
+        st.info("Ingen treff. Prøv et kortere søk eller slå på *Fuzzy søk*.")
         return
 
-    # Per-year overview + drill-down for big result sets
+    # Per-year drill-down
     år_series = pd.to_numeric(df["År"], errors="coerce").dropna().astype(int)
     if not år_series.empty:
-        per_year = (år_series.value_counts().sort_index()
-                    .rename_axis("År").reset_index(name="Antall"))
-        with st.expander("Treff per år", expanded=len(df) > 30):
-            st.bar_chart(per_year, x="År", y="Antall", height=240)
-
-        unique_years = per_year["År"].tolist()
+        unique_years = sorted(år_series.unique().tolist())
         if len(unique_years) > 1:
             options = ["Alle år"] + [str(y) for y in unique_years]
             picked = st.selectbox("Vis kun år", options, index=0)
@@ -419,7 +397,7 @@ def render_search_tab(master: pd.DataFrame, n_entries: int, n_sheets: int):
     if len(df) > MAX_CARDS:
         st.warning(f"Viser de første {MAX_CARDS} treffene. Bruk filter for å snevre inn.")
 
-    terms = [t for t in re.split(r"\s+", query.strip()) if t] if mode != "Fuzzy" else []
+    terms = [] if fuzzy else [t for t in re.split(r"\s+", query.strip()) if t]
 
     for _, row in shown.iterrows():
         dato = _format_date(row.get("Dato"))
@@ -431,7 +409,7 @@ def render_search_tab(master: pd.DataFrame, n_entries: int, n_sheets: int):
         timer_str = f"{timer:g} t" if pd.notna(timer) else ""
         followup = bool(row.get("Følges_opp", False))
         text = str(row.get("Dagbok", "") or "")
-        if mode == "Fuzzy" and query.strip():
+        if fuzzy and query.strip():
             body = _highlight_fuzzy_span(text, query)
         else:
             body = _highlight_terms(text, terms)
@@ -462,7 +440,7 @@ def render_browse_tab(master: pd.DataFrame, per_sheet: dict[str, pd.DataFrame]):
         return
     # Default to most recent dagbok sheet
     default_idx = next((i for i, s in enumerate(sheets) if "2026" in s), len(sheets) - 1)
-    sheet = st.selectbox("Velg ark", sheets, index=default_idx)
+    sheet = st.radio("Velg ark", sheets, index=default_idx, horizontal=True)
     df = per_sheet[sheet].copy()
 
     # Quick stats
