@@ -25,7 +25,7 @@ st.set_page_config(
     page_title=APP_TITLE,
     page_icon="📓",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 CUSTOM_CSS = """
@@ -336,8 +336,27 @@ def _format_year(y) -> str:
     return str(y) if not isinstance(y, float) else str(int(y))
 
 
-def render_search_tab(master: pd.DataFrame):
+def render_search_tab(master: pd.DataFrame, n_entries: int, n_sheets: int):
     st.markdown("### 🔍 Søk i alle år")
+    st.caption(
+        f"{n_entries:,} innførsler · {n_sheets} ark".replace(",", " ")
+    )
+
+    years_int = sorted({int(y) for y in master["År"].dropna().unique()
+                        if str(y).isdigit() or isinstance(y, (int, float))})
+    if years_int:
+        y_min, y_max = years_int[0], years_int[-1]
+        if y_min == y_max:
+            yr_from, yr_to = y_min, y_max
+            st.caption(f"Årsspenn: {y_min}")
+        else:
+            yr_from, yr_to = st.slider(
+                "Årsspenn", min_value=y_min, max_value=y_max,
+                value=(y_min, y_max), step=1,
+            )
+    else:
+        yr_from, yr_to = None, None
+
     col_q, col_mode, col_thr = st.columns([5, 2, 2])
     with col_q:
         query = st.text_input(
@@ -351,50 +370,10 @@ def render_search_tab(master: pd.DataFrame):
         threshold = st.slider("Likhet", 50, 100, 75, disabled=(mode != "Fuzzy"),
                               label_visibility="collapsed")
 
-    # Sidebar filters
-    with st.sidebar:
-        st.markdown("### Filter")
-        years = sorted({y for y in master["År"].unique() if y is not None}, key=lambda x: str(x))
-        sel_years = st.multiselect("År", years, default=years)
-
-        oppdrag_options = sorted(master["Oppdrag"].dropna().unique().tolist())
-        sel_oppdrag = st.multiselect("Oppdrag", oppdrag_options, default=[])
-
-        date_min = master["Dato"].min()
-        date_max = master["Dato"].max()
-        date_range = None
-        if pd.notna(date_min) and pd.notna(date_max):
-            date_range = st.date_input(
-                "Datoområde",
-                value=(date_min.date(), date_max.date()),
-                min_value=date_min.date(),
-                max_value=date_max.date(),
-            )
-
-        if "Timer" in master.columns and master["Timer"].notna().any():
-            tmin, tmax = float(master["Timer"].min()), float(master["Timer"].max())
-            if tmin == tmax:
-                tmax = tmin + 1
-            timer_range = st.slider("Timer", min_value=float(tmin), max_value=float(tmax),
-                                    value=(float(tmin), float(tmax)))
-        else:
-            timer_range = None
-
-        only_followup = st.checkbox("Kun rader merket for oppfølging")
-
     df = master.copy()
-    if sel_years:
-        df = df[df["År"].isin(sel_years)]
-    if sel_oppdrag:
-        df = df[df["Oppdrag"].isin(sel_oppdrag)]
-    if date_range and isinstance(date_range, tuple) and len(date_range) == 2:
-        d0, d1 = pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1]) + pd.Timedelta(days=1)
-        df = df[(df["Dato"].isna()) | ((df["Dato"] >= d0) & (df["Dato"] < d1))]
-    if timer_range is not None and "Timer" in df.columns:
-        lo, hi = timer_range
-        df = df[(df["Timer"].isna()) | ((df["Timer"] >= lo) & (df["Timer"] <= hi))]
-    if only_followup and "Følges_opp" in df.columns:
-        df = df[df["Følges_opp"] == True]
+    if yr_from is not None and yr_to is not None:
+        år_int = pd.to_numeric(df["År"], errors="coerce")
+        df = df[år_int.between(yr_from, yr_to)]
 
     df = filter_search(df, query, mode, threshold)
 
@@ -411,6 +390,27 @@ def render_search_tab(master: pd.DataFrame):
 
     if df.empty:
         st.info("Ingen treff. Prøv et kortere søk eller bytt til *Fuzzy*-modus.")
+        return
+
+    # Per-year overview + drill-down for big result sets
+    år_series = pd.to_numeric(df["År"], errors="coerce").dropna().astype(int)
+    if not år_series.empty:
+        per_year = (år_series.value_counts().sort_index()
+                    .rename_axis("År").reset_index(name="Antall"))
+        with st.expander("Treff per år", expanded=len(df) > 30):
+            st.bar_chart(per_year, x="År", y="Antall", height=240)
+
+        unique_years = per_year["År"].tolist()
+        if len(unique_years) > 1:
+            options = ["Alle år"] + [str(y) for y in unique_years]
+            picked = st.selectbox("Vis kun år", options, index=0)
+            if picked != "Alle år":
+                picked_int = int(picked)
+                år_int_full = pd.to_numeric(df["År"], errors="coerce")
+                df = df[år_int_full == picked_int]
+
+    if df.empty:
+        st.info("Ingen treff for valgt år.")
         return
 
     # Render result cards (cap to 300 for performance / readability)
@@ -536,22 +536,11 @@ def main():
     xlsx_path, signature = _resolve_xlsx_path()
     master, per_sheet = load_data(xlsx_path, signature)
 
-    with st.sidebar:
-        st.markdown(f"### 📓 {APP_TITLE}")
-        st.caption(
-            f"{len(master):,} innførsler · {len(per_sheet)} ark"
-            .replace(",", " ")
-        )
-        if st.button("Logg ut", use_container_width=True):
-            st.session_state.pop("authed", None)
-            st.rerun()
-        st.divider()
-
     tab_search, tab_browse, tab_overview = st.tabs(
         ["🔍 Søk", "📅 Bla gjennom år", "📊 Oversikt"]
     )
     with tab_search:
-        render_search_tab(master)
+        render_search_tab(master, len(master), len(per_sheet))
     with tab_browse:
         render_browse_tab(master, per_sheet)
     with tab_overview:
